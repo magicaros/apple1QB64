@@ -1,0 +1,987 @@
+'=============================================================================
+' Fake6502 for QB64 - NMOS MOS 6502 CPU core                       (routines)
+'-----------------------------------------------------------------------------
+' Translated to QB64 from Fake6502 CPU emulator 
+' (c)2011-2013 Mike Chambers, released into the public domain.
+' This QB64 translation is likewise released into the public domain.
+'
+' Behaviour follows the original NMOS 6502 (MOS Technology 6502/6510):
+'  - all 151 documented opcodes with exact NMOS cycle counts, including the
+'    +1 page-crossing and +1/+2 taken-branch penalties
+'  - NMOS decimal mode: ADC/SBC give the real chip's results for every input,
+'    including invalid BCD; N/V/Z behave as on NMOS (no extra decimal cycle)
+'  - all 105 undocumented opcodes: SLO RLA SRE RRA SAX LAX DCP ISC ANC ALR
+'    ARR SBX ANE LXA LAS SHA SHX SHY TAS, the multi-byte NOPs, the extra SBC
+'    ($EB) and JAM/KIL, which halts the CPU until reset6502
+'  - JMP ($xxFF) page-wrap bug, zero-page wraparound, B flag only on stack
+'  - read-modify-write instructions write the old value back before the new
+'    one, as the real chip does (matters for memory-mapped I/O)
+'
+' Changes from the original C code (bugs fixed and gaps filled):
+'  - decimal ADC/SBC rewritten; the BCD adjust was overwritten and
+'    an extra (65C02-style) cycle was added
+'  - RTI/PLP no longer load the B flag; IRQ/NMI push P with B clear
+'  - irq6502 honours the I flag; IRQ/NMI/reset each take 7 cycles
+'  - unstable opcodes ($0B $2B $4B $6B $8B $AB $CB $93 $9B $9C $9E $9F $BB)
+'    and JAM opcodes implemented instead of acting as NOPs
+'  - SAX no longer performs stray writes of A and X before the real store
+'  - hookexternal() dropped (QB64 has no function pointers): just do your
+'    per-instruction work in your own loop around step6502
+'=============================================================================
+
+'-----------------------------------------------------------------------------
+' Public API
+'-----------------------------------------------------------------------------
+
+' Power-on reset: clears A, X, Y, sets SP=$FD and P=$24 (I set, D clear),
+' un-jams the CPU and loads PC from the reset vector at $FFFC/$FFFD.
+SUB reset6502
+    cpu6502.a = 0
+    cpu6502.x = 0
+    cpu6502.y = 0
+    cpu6502.sp = &HFD
+    cpu6502.status = F6502_FLAG_CONSTANT OR F6502_FLAG_INTERRUPT
+    cpu6502.jammed = 0
+    cpu6502.pc = f65_rd(&HFFFC&) OR (f65_rd(&HFFFD&) * 256)
+    cpu6502.clockticks = cpu6502.clockticks + 7
+END SUB
+
+' Run until at least tickcount more clock cycles have elapsed. Any overshoot
+' from the last instruction is carried over to the next call, so calling
+' exec6502 17045 once per 60 Hz frame gives an accurate ~1.0227 MHz CPU.
+SUB exec6502 (tickcount AS LONG)
+    cpu6502.clockgoal = cpu6502.clockgoal + tickcount
+    DO WHILE cpu6502.clockticks < cpu6502.clockgoal
+        IF cpu6502.jammed THEN
+            cpu6502.clockticks = cpu6502.clockgoal
+            EXIT DO
+        END IF
+        f65_execute
+    LOOP
+END SUB
+
+' Execute exactly one instruction.
+SUB step6502
+    IF cpu6502.jammed = 0 THEN f65_execute
+    cpu6502.clockgoal = cpu6502.clockticks
+END SUB
+
+' Maskable interrupt. Ignored while the I flag is set; the 6502 IRQ line is
+' level-triggered, so keep calling this while your device holds IRQ low.
+SUB irq6502
+    IF cpu6502.jammed THEN EXIT SUB
+    IF (cpu6502.status AND F6502_FLAG_INTERRUPT) = 0 THEN f65_interrupt &HFFFE&
+END SUB
+
+' Non-maskable interrupt (call once per falling edge of the NMI line).
+SUB nmi6502
+    IF cpu6502.jammed THEN EXIT SUB
+    f65_interrupt &HFFFA&
+END SUB
+
+'-----------------------------------------------------------------------------
+' Bus, stack and flag helpers
+'-----------------------------------------------------------------------------
+
+FUNCTION f65_rd& (address AS LONG)
+    f65_rd& = read6502(address AND &HFFFF&)
+END FUNCTION
+
+SUB f65_wr (address AS LONG, value AS LONG)
+    write6502 address AND &HFFFF&, value AND &HFF
+END SUB
+
+SUB f65_push (value AS LONG)
+    f65_wr &H100& OR cpu6502.sp, value
+    cpu6502.sp = (cpu6502.sp - 1) AND &HFF
+END SUB
+
+FUNCTION f65_pull&
+    cpu6502.sp = (cpu6502.sp + 1) AND &HFF
+    f65_pull& = f65_rd(&H100& OR cpu6502.sp)
+END FUNCTION
+
+SUB f65_push16 (value AS LONG)
+    f65_push (value \ 256) AND &HFF
+    f65_push value AND &HFF
+END SUB
+
+FUNCTION f65_pull16&
+    DIM lo AS LONG
+    lo = f65_pull
+    f65_pull16& = lo OR (f65_pull * 256)
+END FUNCTION
+
+SUB f65_incpc
+    cpu6502.pc = (cpu6502.pc + 1) AND &HFFFF&
+END SUB
+
+' Set N and Z from an 8-bit result
+SUB f65_setnz (value AS LONG)
+    DIM p AS LONG
+    p = cpu6502.status AND &H7D
+    IF (value AND &HFF) = 0 THEN p = p OR F6502_FLAG_ZERO
+    cpu6502.status = p OR (value AND &H80)
+END SUB
+
+' Set or clear one flag (flag = bit mask, cond = any nonzero value sets it)
+SUB f65_setflag (flag AS LONG, cond AS LONG)
+    IF cond THEN
+        cpu6502.status = cpu6502.status OR flag
+    ELSE
+        cpu6502.status = cpu6502.status AND (NOT flag)
+    END IF
+END SUB
+
+SUB f65_interrupt (vector AS LONG)
+    f65_push16 cpu6502.pc
+    f65_push (cpu6502.status AND (NOT F6502_FLAG_BREAK)) OR F6502_FLAG_CONSTANT
+    cpu6502.status = cpu6502.status OR F6502_FLAG_INTERRUPT
+    cpu6502.pc = f65_rd(vector) OR (f65_rd(vector + 1) * 256)
+    cpu6502.clockticks = cpu6502.clockticks + 7
+END SUB
+
+'-----------------------------------------------------------------------------
+' Addressing modes: each one sets f65_ea (effective address).
+' Modes ending in "r" are used by read instructions and add the +1 cycle
+' page-crossing penalty; stores and read-modify-write never take it.
+'-----------------------------------------------------------------------------
+
+SUB f65_imm
+    f65_ea = cpu6502.pc
+    f65_incpc
+END SUB
+
+SUB f65_zp
+    f65_ea = f65_rd(cpu6502.pc)
+    f65_incpc
+END SUB
+
+SUB f65_zpx
+    f65_ea = (f65_rd(cpu6502.pc) + cpu6502.x) AND &HFF
+    f65_incpc
+END SUB
+
+SUB f65_zpy
+    f65_ea = (f65_rd(cpu6502.pc) + cpu6502.y) AND &HFF
+    f65_incpc
+END SUB
+
+SUB f65_abs
+    f65_ea = f65_rd(cpu6502.pc) OR (f65_rd(cpu6502.pc + 1) * 256)
+    cpu6502.pc = (cpu6502.pc + 2) AND &HFFFF&
+END SUB
+
+' Note: QB64 passes arguments by reference, and callers pass f65_ea itself,
+' so the base address must be copied before f65_ea is overwritten.
+SUB f65_index (baseaddr AS LONG, idx AS LONG)
+    DIM b AS LONG
+    b = baseaddr
+    f65_basehi = b \ 256
+    f65_ea = (b + idx) AND &HFFFF&
+    f65_crossed = (b AND &HFF00&) <> (f65_ea AND &HFF00&)
+END SUB
+
+SUB f65_absx
+    f65_abs
+    f65_index f65_ea, cpu6502.x
+END SUB
+
+SUB f65_absxr
+    f65_absx
+    IF f65_crossed THEN f65_cyc = f65_cyc + 1
+END SUB
+
+SUB f65_absy
+    f65_abs
+    f65_index f65_ea, cpu6502.y
+END SUB
+
+SUB f65_absyr
+    f65_absy
+    IF f65_crossed THEN f65_cyc = f65_cyc + 1
+END SUB
+
+' (indirect) - JMP only. Reproduces the NMOS bug: the pointer's high byte is
+' fetched from the start of the same page when the low byte is at $xxFF.
+SUB f65_ind
+    DIM ptr AS LONG
+    f65_abs
+    ptr = f65_ea
+    f65_ea = f65_rd(ptr) OR (f65_rd((ptr AND &HFF00&) OR ((ptr + 1) AND &HFF)) * 256)
+END SUB
+
+' (indirect,X) - pointer always wraps within the zero page
+SUB f65_indx
+    DIM zp AS LONG
+    zp = (f65_rd(cpu6502.pc) + cpu6502.x) AND &HFF
+    f65_incpc
+    f65_ea = f65_rd(zp) OR (f65_rd((zp + 1) AND &HFF) * 256)
+END SUB
+
+' (indirect),Y - pointer always wraps within the zero page
+SUB f65_indy
+    DIM zp AS LONG
+    zp = f65_rd(cpu6502.pc)
+    f65_incpc
+    f65_index f65_rd(zp) OR (f65_rd((zp + 1) AND &HFF) * 256), cpu6502.y
+END SUB
+
+SUB f65_indyr
+    f65_indy
+    IF f65_crossed THEN f65_cyc = f65_cyc + 1
+END SUB
+
+'-----------------------------------------------------------------------------
+' ALU cores (shared by documented and undocumented instructions)
+'-----------------------------------------------------------------------------
+
+' ADC with NMOS decimal-mode behaviour (valid for any input, including
+' non-BCD values). In decimal mode Z comes from the binary sum, while N and V
+' come from the intermediate result after the low-nibble adjustment, exactly
+' as on the real chip.
+SUB f65_adcv (value AS LONG)
+    DIM a AS LONG, c AS LONG, r AS LONG, lo AS LONG, s AS LONG
+    a = cpu6502.a
+    c = cpu6502.status AND F6502_FLAG_CARRY
+    r = a + value + c
+    IF cpu6502.status AND F6502_FLAG_DECIMAL THEN
+        lo = (a AND &H0F) + (value AND &H0F) + c
+        IF lo >= &H0A THEN lo = ((lo + &H06) AND &H0F) + &H10
+        s = (a AND &HF0) + (value AND &HF0) + lo
+        f65_setflag F6502_FLAG_ZERO, (r AND &HFF) = 0
+        f65_setflag F6502_FLAG_SIGN, s AND &H80
+        f65_setflag F6502_FLAG_OVERFLOW, ((a XOR s) AND (value XOR s) AND &H80)
+        IF s >= &HA0 THEN s = s + &H60
+        f65_setflag F6502_FLAG_CARRY, s >= &H100
+        cpu6502.a = s AND &HFF
+    ELSE
+        f65_setflag F6502_FLAG_CARRY, r > &HFF
+        f65_setflag F6502_FLAG_OVERFLOW, ((a XOR r) AND (value XOR r) AND &H80)
+        f65_setnz r
+        cpu6502.a = r AND &HFF
+    END IF
+END SUB
+
+' SBC with NMOS decimal-mode behaviour. On the NMOS chip all four flags come
+' from the binary subtraction even in decimal mode; only A is adjusted.
+SUB f65_sbcv (value AS LONG)
+    DIM a AS LONG, c AS LONG, r AS LONG, lo AS LONG, s AS LONG
+    a = cpu6502.a
+    c = cpu6502.status AND F6502_FLAG_CARRY
+    r = a - value - (1 - c)
+    f65_setflag F6502_FLAG_CARRY, r >= 0
+    f65_setflag F6502_FLAG_OVERFLOW, ((a XOR value) AND (a XOR r) AND &H80)
+    f65_setnz r
+    IF cpu6502.status AND F6502_FLAG_DECIMAL THEN
+        lo = (a AND &H0F) - (value AND &H0F) + c - 1
+        IF lo < 0 THEN lo = ((lo - &H06) AND &H0F) - &H10
+        s = (a AND &HF0) - (value AND &HF0) + lo
+        IF s < 0 THEN s = s - &H60
+        cpu6502.a = s AND &HFF
+    ELSE
+        cpu6502.a = r AND &HFF
+    END IF
+END SUB
+
+SUB f65_cmpv (reg AS LONG, value AS LONG)
+    DIM r AS LONG
+    r = reg - value
+    f65_setflag F6502_FLAG_CARRY, r >= 0
+    f65_setnz r
+END SUB
+
+FUNCTION f65_aslv& (value AS LONG)
+    DIM r AS LONG
+    r = value * 2
+    f65_setflag F6502_FLAG_CARRY, r AND &H100
+    f65_setnz r
+    f65_aslv& = r AND &HFF
+END FUNCTION
+
+FUNCTION f65_lsrv& (value AS LONG)
+    DIM r AS LONG
+    r = value \ 2
+    f65_setflag F6502_FLAG_CARRY, value AND 1
+    f65_setnz r
+    f65_lsrv& = r
+END FUNCTION
+
+FUNCTION f65_rolv& (value AS LONG)
+    DIM r AS LONG
+    r = (value * 2) OR (cpu6502.status AND F6502_FLAG_CARRY)
+    f65_setflag F6502_FLAG_CARRY, r AND &H100
+    f65_setnz r
+    f65_rolv& = r AND &HFF
+END FUNCTION
+
+FUNCTION f65_rorv& (value AS LONG)
+    DIM r AS LONG
+    r = (value \ 2) OR ((cpu6502.status AND F6502_FLAG_CARRY) * &H80)
+    f65_setflag F6502_FLAG_CARRY, value AND 1
+    f65_setnz r
+    f65_rorv& = r
+END FUNCTION
+
+' Read-modify-write: fetch the operand and write it straight back unchanged,
+' as the NMOS 6502 does in the cycle before writing the modified value.
+FUNCTION f65_rmwread&
+    DIM v AS LONG
+    v = f65_rd(f65_ea)
+    f65_wr f65_ea, v
+    f65_rmwread& = v
+END FUNCTION
+
+'-----------------------------------------------------------------------------
+' Documented instructions
+'-----------------------------------------------------------------------------
+
+SUB f65_adc
+    f65_adcv f65_rd(f65_ea)
+END SUB
+
+SUB f65_and
+    cpu6502.a = cpu6502.a AND f65_rd(f65_ea)
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_asl
+    f65_wr f65_ea, f65_aslv(f65_rmwread)
+END SUB
+
+SUB f65_asla
+    cpu6502.a = f65_aslv(cpu6502.a)
+END SUB
+
+SUB f65_bit
+    DIM v AS LONG
+    v = f65_rd(f65_ea)
+    f65_setflag F6502_FLAG_ZERO, (cpu6502.a AND v) = 0
+    cpu6502.status = (cpu6502.status AND &H3F) OR (v AND &HC0)
+END SUB
+
+' Relative branch: +1 cycle if taken, +1 more if it lands on another page
+SUB f65_branch (cond AS LONG)
+    DIM offset AS LONG, newpc AS LONG
+    offset = f65_rd(cpu6502.pc)
+    f65_incpc
+    IF cond THEN
+        IF offset >= &H80 THEN offset = offset - &H100
+        newpc = (cpu6502.pc + offset) AND &HFFFF&
+        f65_cyc = f65_cyc + 1
+        IF (newpc AND &HFF00&) <> (cpu6502.pc AND &HFF00&) THEN f65_cyc = f65_cyc + 1
+        cpu6502.pc = newpc
+    END IF
+END SUB
+
+SUB f65_brk
+    f65_incpc ' skip the signature byte
+    f65_push16 cpu6502.pc
+    f65_push cpu6502.status OR F6502_FLAG_BREAK OR F6502_FLAG_CONSTANT
+    cpu6502.status = cpu6502.status OR F6502_FLAG_INTERRUPT
+    cpu6502.pc = f65_rd(&HFFFE&) OR (f65_rd(&HFFFF&) * 256)
+END SUB
+
+SUB f65_cmp
+    f65_cmpv cpu6502.a, f65_rd(f65_ea)
+END SUB
+
+SUB f65_cpx
+    f65_cmpv cpu6502.x, f65_rd(f65_ea)
+END SUB
+
+SUB f65_cpy
+    f65_cmpv cpu6502.y, f65_rd(f65_ea)
+END SUB
+
+SUB f65_dec
+    DIM r AS LONG
+    r = (f65_rmwread - 1) AND &HFF
+    f65_setnz r
+    f65_wr f65_ea, r
+END SUB
+
+SUB f65_dex
+    cpu6502.x = (cpu6502.x - 1) AND &HFF
+    f65_setnz cpu6502.x
+END SUB
+
+SUB f65_dey
+    cpu6502.y = (cpu6502.y - 1) AND &HFF
+    f65_setnz cpu6502.y
+END SUB
+
+SUB f65_eor
+    cpu6502.a = cpu6502.a XOR f65_rd(f65_ea)
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_inc
+    DIM r AS LONG
+    r = (f65_rmwread + 1) AND &HFF
+    f65_setnz r
+    f65_wr f65_ea, r
+END SUB
+
+SUB f65_inx
+    cpu6502.x = (cpu6502.x + 1) AND &HFF
+    f65_setnz cpu6502.x
+END SUB
+
+SUB f65_iny
+    cpu6502.y = (cpu6502.y + 1) AND &HFF
+    f65_setnz cpu6502.y
+END SUB
+
+SUB f65_jmp
+    cpu6502.pc = f65_ea
+END SUB
+
+SUB f65_jsr
+    f65_push16 (cpu6502.pc - 1) AND &HFFFF&
+    cpu6502.pc = f65_ea
+END SUB
+
+SUB f65_lda
+    cpu6502.a = f65_rd(f65_ea)
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_ldx
+    cpu6502.x = f65_rd(f65_ea)
+    f65_setnz cpu6502.x
+END SUB
+
+SUB f65_ldy
+    cpu6502.y = f65_rd(f65_ea)
+    f65_setnz cpu6502.y
+END SUB
+
+SUB f65_lsr
+    f65_wr f65_ea, f65_lsrv(f65_rmwread)
+END SUB
+
+SUB f65_lsra
+    cpu6502.a = f65_lsrv(cpu6502.a)
+END SUB
+
+' NOP that reads its operand (zp/abs/indexed/immediate forms do a real read)
+SUB f65_nopr
+    DIM dummy AS LONG
+    dummy = f65_rd(f65_ea)
+END SUB
+
+SUB f65_ora
+    cpu6502.a = cpu6502.a OR f65_rd(f65_ea)
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_pha
+    f65_push cpu6502.a
+END SUB
+
+SUB f65_php
+    f65_push cpu6502.status OR F6502_FLAG_BREAK OR F6502_FLAG_CONSTANT
+END SUB
+
+SUB f65_pla
+    cpu6502.a = f65_pull
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_plp
+    cpu6502.status = (f65_pull AND &HCF) OR F6502_FLAG_CONSTANT
+END SUB
+
+SUB f65_rol
+    f65_wr f65_ea, f65_rolv(f65_rmwread)
+END SUB
+
+SUB f65_rola
+    cpu6502.a = f65_rolv(cpu6502.a)
+END SUB
+
+SUB f65_ror
+    f65_wr f65_ea, f65_rorv(f65_rmwread)
+END SUB
+
+SUB f65_rora
+    cpu6502.a = f65_rorv(cpu6502.a)
+END SUB
+
+SUB f65_rti
+    cpu6502.status = (f65_pull AND &HCF) OR F6502_FLAG_CONSTANT
+    cpu6502.pc = f65_pull16
+END SUB
+
+SUB f65_rts
+    cpu6502.pc = (f65_pull16 + 1) AND &HFFFF&
+END SUB
+
+SUB f65_sbc
+    f65_sbcv f65_rd(f65_ea)
+END SUB
+
+SUB f65_sta
+    f65_wr f65_ea, cpu6502.a
+END SUB
+
+SUB f65_stx
+    f65_wr f65_ea, cpu6502.x
+END SUB
+
+SUB f65_sty
+    f65_wr f65_ea, cpu6502.y
+END SUB
+
+SUB f65_tax
+    cpu6502.x = cpu6502.a
+    f65_setnz cpu6502.x
+END SUB
+
+SUB f65_tay
+    cpu6502.y = cpu6502.a
+    f65_setnz cpu6502.y
+END SUB
+
+SUB f65_tsx
+    cpu6502.x = cpu6502.sp
+    f65_setnz cpu6502.x
+END SUB
+
+SUB f65_txa
+    cpu6502.a = cpu6502.x
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_txs
+    cpu6502.sp = cpu6502.x
+END SUB
+
+SUB f65_tya
+    cpu6502.a = cpu6502.y
+    f65_setnz cpu6502.a
+END SUB
+
+'-----------------------------------------------------------------------------
+' Undocumented (illegal) NMOS instructions
+'-----------------------------------------------------------------------------
+
+SUB f65_slo ' ASL memory, then ORA
+    DIM r AS LONG
+    r = f65_aslv(f65_rmwread)
+    f65_wr f65_ea, r
+    cpu6502.a = cpu6502.a OR r
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_rla ' ROL memory, then AND
+    DIM r AS LONG
+    r = f65_rolv(f65_rmwread)
+    f65_wr f65_ea, r
+    cpu6502.a = cpu6502.a AND r
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_sre ' LSR memory, then EOR
+    DIM r AS LONG
+    r = f65_lsrv(f65_rmwread)
+    f65_wr f65_ea, r
+    cpu6502.a = cpu6502.a XOR r
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_rra ' ROR memory, then ADC (decimal mode applies)
+    DIM r AS LONG
+    r = f65_rorv(f65_rmwread)
+    f65_wr f65_ea, r
+    f65_adcv r
+END SUB
+
+SUB f65_sax ' store A AND X, no flags
+    f65_wr f65_ea, cpu6502.a AND cpu6502.x
+END SUB
+
+SUB f65_lax ' LDA + LDX
+    cpu6502.a = f65_rd(f65_ea)
+    cpu6502.x = cpu6502.a
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_dcp ' DEC memory, then CMP
+    DIM r AS LONG
+    r = (f65_rmwread - 1) AND &HFF
+    f65_wr f65_ea, r
+    f65_cmpv cpu6502.a, r
+END SUB
+
+SUB f65_isc ' INC memory, then SBC (decimal mode applies)
+    DIM r AS LONG
+    r = (f65_rmwread + 1) AND &HFF
+    f65_wr f65_ea, r
+    f65_sbcv r
+END SUB
+
+SUB f65_anc ' AND #imm, C = N
+    cpu6502.a = cpu6502.a AND f65_rd(f65_ea)
+    f65_setnz cpu6502.a
+    f65_setflag F6502_FLAG_CARRY, cpu6502.a AND &H80
+END SUB
+
+SUB f65_alr ' AND #imm, then LSR A
+    cpu6502.a = f65_lsrv(cpu6502.a AND f65_rd(f65_ea))
+END SUB
+
+' ARR: AND #imm then ROR A, with its own odd flag rules (and its own decimal
+' mode fix-up on the NMOS chip).
+SUB f65_arr
+    DIM t AS LONG, r AS LONG, c AS LONG
+    t = cpu6502.a AND f65_rd(f65_ea)
+    c = cpu6502.status AND F6502_FLAG_CARRY
+    r = (t \ 2) OR (c * &H80)
+    IF cpu6502.status AND F6502_FLAG_DECIMAL THEN
+        f65_setnz r
+        f65_setflag F6502_FLAG_OVERFLOW, (t XOR r) AND &H40
+        IF ((t AND &H0F) + (t AND &H01)) > 5 THEN r = (r AND &HF0) OR ((r + 6) AND &H0F)
+        IF ((t AND &HF0) + (t AND &H10)) > &H50 THEN
+            r = (r + &H60) AND &HFF
+            f65_setflag F6502_FLAG_CARRY, -1
+        ELSE
+            f65_setflag F6502_FLAG_CARRY, 0
+        END IF
+    ELSE
+        f65_setnz r
+        f65_setflag F6502_FLAG_CARRY, r AND &H40
+        f65_setflag F6502_FLAG_OVERFLOW, ((r \ 64) XOR (r \ 32)) AND 1
+    END IF
+    cpu6502.a = r
+END SUB
+
+SUB f65_sbx ' X = (A AND X) - #imm, flags like CMP, ignores decimal mode
+    DIM r AS LONG
+    r = (cpu6502.a AND cpu6502.x) - f65_rd(f65_ea)
+    f65_setflag F6502_FLAG_CARRY, r >= 0
+    cpu6502.x = r AND &HFF
+    f65_setnz cpu6502.x
+END SUB
+
+SUB f65_ane ' unstable: A = (A OR magic) AND X AND #imm
+    cpu6502.a = (cpu6502.a OR F6502_MAGIC) AND cpu6502.x AND f65_rd(f65_ea)
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_lxa ' unstable: A = X = (A OR magic) AND #imm
+    cpu6502.a = (cpu6502.a OR F6502_MAGIC) AND f65_rd(f65_ea)
+    cpu6502.x = cpu6502.a
+    f65_setnz cpu6502.a
+END SUB
+
+SUB f65_las ' A = X = SP = memory AND SP
+    cpu6502.sp = cpu6502.sp AND f65_rd(f65_ea)
+    cpu6502.a = cpu6502.sp
+    cpu6502.x = cpu6502.sp
+    f65_setnz cpu6502.a
+END SUB
+
+' Common store for SHA/SHX/SHY/TAS: stores value AND (high byte of base
+' address + 1). If indexing crossed a page, the stored value also replaces
+' the high byte of the target address, as on the real chip.
+SUB f65_shstore (value AS LONG)
+    DIM v AS LONG, address AS LONG
+    v = value AND ((f65_basehi + 1) AND &HFF)
+    address = f65_ea
+    IF f65_crossed THEN address = (v * 256) OR (address AND &HFF)
+    f65_wr address, v
+END SUB
+
+SUB f65_sha
+    f65_shstore cpu6502.a AND cpu6502.x
+END SUB
+
+SUB f65_shx
+    f65_shstore cpu6502.x
+END SUB
+
+SUB f65_shy
+    f65_shstore cpu6502.y
+END SUB
+
+SUB f65_tas ' SP = A AND X, then store like SHA
+    cpu6502.sp = cpu6502.a AND cpu6502.x
+    f65_shstore cpu6502.sp
+END SUB
+
+SUB f65_jam ' KIL/JAM: the CPU locks up until reset6502
+    cpu6502.pc = (cpu6502.pc - 1) AND &HFFFF&
+    cpu6502.jammed = -1
+END SUB
+
+'-----------------------------------------------------------------------------
+' Fetch, decode and execute one instruction
+'-----------------------------------------------------------------------------
+
+SUB f65_execute
+    DIM opcode AS LONG
+    opcode = f65_rd(cpu6502.pc)
+    f65_incpc
+    SELECT CASE opcode
+        CASE &H00: f65_cyc = 7: f65_brk ' BRK imp
+        CASE &H01: f65_cyc = 6: f65_indx: f65_ora ' ORA indx
+        CASE &H02: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H03: f65_cyc = 8: f65_indx: f65_slo ' SLO indx
+        CASE &H04: f65_cyc = 3: f65_zp: f65_nopr ' NOP zp
+        CASE &H05: f65_cyc = 3: f65_zp: f65_ora ' ORA zp
+        CASE &H06: f65_cyc = 5: f65_zp: f65_asl ' ASL zp
+        CASE &H07: f65_cyc = 5: f65_zp: f65_slo ' SLO zp
+        CASE &H08: f65_cyc = 3: f65_php ' PHP imp
+        CASE &H09: f65_cyc = 2: f65_imm: f65_ora ' ORA imm
+        CASE &H0A: f65_cyc = 2: f65_asla ' ASL acc
+        CASE &H0B: f65_cyc = 2: f65_imm: f65_anc ' ANC imm
+        CASE &H0C: f65_cyc = 4: f65_abs: f65_nopr ' NOP abs
+        CASE &H0D: f65_cyc = 4: f65_abs: f65_ora ' ORA abs
+        CASE &H0E: f65_cyc = 6: f65_abs: f65_asl ' ASL abs
+        CASE &H0F: f65_cyc = 6: f65_abs: f65_slo ' SLO abs
+        CASE &H10: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_SIGN) = 0 ' BPL rel
+        CASE &H11: f65_cyc = 5: f65_indyr: f65_ora ' ORA indy
+        CASE &H12: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H13: f65_cyc = 8: f65_indy: f65_slo ' SLO indy
+        CASE &H14: f65_cyc = 4: f65_zpx: f65_nopr ' NOP zpx
+        CASE &H15: f65_cyc = 4: f65_zpx: f65_ora ' ORA zpx
+        CASE &H16: f65_cyc = 6: f65_zpx: f65_asl ' ASL zpx
+        CASE &H17: f65_cyc = 6: f65_zpx: f65_slo ' SLO zpx
+        CASE &H18: f65_cyc = 2: cpu6502.status = cpu6502.status AND (NOT F6502_FLAG_CARRY) ' CLC imp
+        CASE &H19: f65_cyc = 4: f65_absyr: f65_ora ' ORA absy
+        CASE &H1A: f65_cyc = 2 ' NOP imp
+        CASE &H1B: f65_cyc = 7: f65_absy: f65_slo ' SLO absy
+        CASE &H1C: f65_cyc = 4: f65_absxr: f65_nopr ' NOP absx
+        CASE &H1D: f65_cyc = 4: f65_absxr: f65_ora ' ORA absx
+        CASE &H1E: f65_cyc = 7: f65_absx: f65_asl ' ASL absx
+        CASE &H1F: f65_cyc = 7: f65_absx: f65_slo ' SLO absx
+        CASE &H20: f65_cyc = 6: f65_abs: f65_jsr ' JSR abs
+        CASE &H21: f65_cyc = 6: f65_indx: f65_and ' AND indx
+        CASE &H22: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H23: f65_cyc = 8: f65_indx: f65_rla ' RLA indx
+        CASE &H24: f65_cyc = 3: f65_zp: f65_bit ' BIT zp
+        CASE &H25: f65_cyc = 3: f65_zp: f65_and ' AND zp
+        CASE &H26: f65_cyc = 5: f65_zp: f65_rol ' ROL zp
+        CASE &H27: f65_cyc = 5: f65_zp: f65_rla ' RLA zp
+        CASE &H28: f65_cyc = 4: f65_plp ' PLP imp
+        CASE &H29: f65_cyc = 2: f65_imm: f65_and ' AND imm
+        CASE &H2A: f65_cyc = 2: f65_rola ' ROL acc
+        CASE &H2B: f65_cyc = 2: f65_imm: f65_anc ' ANC imm
+        CASE &H2C: f65_cyc = 4: f65_abs: f65_bit ' BIT abs
+        CASE &H2D: f65_cyc = 4: f65_abs: f65_and ' AND abs
+        CASE &H2E: f65_cyc = 6: f65_abs: f65_rol ' ROL abs
+        CASE &H2F: f65_cyc = 6: f65_abs: f65_rla ' RLA abs
+        CASE &H30: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_SIGN) <> 0 ' BMI rel
+        CASE &H31: f65_cyc = 5: f65_indyr: f65_and ' AND indy
+        CASE &H32: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H33: f65_cyc = 8: f65_indy: f65_rla ' RLA indy
+        CASE &H34: f65_cyc = 4: f65_zpx: f65_nopr ' NOP zpx
+        CASE &H35: f65_cyc = 4: f65_zpx: f65_and ' AND zpx
+        CASE &H36: f65_cyc = 6: f65_zpx: f65_rol ' ROL zpx
+        CASE &H37: f65_cyc = 6: f65_zpx: f65_rla ' RLA zpx
+        CASE &H38: f65_cyc = 2: cpu6502.status = cpu6502.status OR F6502_FLAG_CARRY ' SEC imp
+        CASE &H39: f65_cyc = 4: f65_absyr: f65_and ' AND absy
+        CASE &H3A: f65_cyc = 2 ' NOP imp
+        CASE &H3B: f65_cyc = 7: f65_absy: f65_rla ' RLA absy
+        CASE &H3C: f65_cyc = 4: f65_absxr: f65_nopr ' NOP absx
+        CASE &H3D: f65_cyc = 4: f65_absxr: f65_and ' AND absx
+        CASE &H3E: f65_cyc = 7: f65_absx: f65_rol ' ROL absx
+        CASE &H3F: f65_cyc = 7: f65_absx: f65_rla ' RLA absx
+        CASE &H40: f65_cyc = 6: f65_rti ' RTI imp
+        CASE &H41: f65_cyc = 6: f65_indx: f65_eor ' EOR indx
+        CASE &H42: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H43: f65_cyc = 8: f65_indx: f65_sre ' SRE indx
+        CASE &H44: f65_cyc = 3: f65_zp: f65_nopr ' NOP zp
+        CASE &H45: f65_cyc = 3: f65_zp: f65_eor ' EOR zp
+        CASE &H46: f65_cyc = 5: f65_zp: f65_lsr ' LSR zp
+        CASE &H47: f65_cyc = 5: f65_zp: f65_sre ' SRE zp
+        CASE &H48: f65_cyc = 3: f65_pha ' PHA imp
+        CASE &H49: f65_cyc = 2: f65_imm: f65_eor ' EOR imm
+        CASE &H4A: f65_cyc = 2: f65_lsra ' LSR acc
+        CASE &H4B: f65_cyc = 2: f65_imm: f65_alr ' ALR imm
+        CASE &H4C: f65_cyc = 3: f65_abs: f65_jmp ' JMP abs
+        CASE &H4D: f65_cyc = 4: f65_abs: f65_eor ' EOR abs
+        CASE &H4E: f65_cyc = 6: f65_abs: f65_lsr ' LSR abs
+        CASE &H4F: f65_cyc = 6: f65_abs: f65_sre ' SRE abs
+        CASE &H50: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_OVERFLOW) = 0 ' BVC rel
+        CASE &H51: f65_cyc = 5: f65_indyr: f65_eor ' EOR indy
+        CASE &H52: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H53: f65_cyc = 8: f65_indy: f65_sre ' SRE indy
+        CASE &H54: f65_cyc = 4: f65_zpx: f65_nopr ' NOP zpx
+        CASE &H55: f65_cyc = 4: f65_zpx: f65_eor ' EOR zpx
+        CASE &H56: f65_cyc = 6: f65_zpx: f65_lsr ' LSR zpx
+        CASE &H57: f65_cyc = 6: f65_zpx: f65_sre ' SRE zpx
+        CASE &H58: f65_cyc = 2: cpu6502.status = cpu6502.status AND (NOT F6502_FLAG_INTERRUPT) ' CLI imp
+        CASE &H59: f65_cyc = 4: f65_absyr: f65_eor ' EOR absy
+        CASE &H5A: f65_cyc = 2 ' NOP imp
+        CASE &H5B: f65_cyc = 7: f65_absy: f65_sre ' SRE absy
+        CASE &H5C: f65_cyc = 4: f65_absxr: f65_nopr ' NOP absx
+        CASE &H5D: f65_cyc = 4: f65_absxr: f65_eor ' EOR absx
+        CASE &H5E: f65_cyc = 7: f65_absx: f65_lsr ' LSR absx
+        CASE &H5F: f65_cyc = 7: f65_absx: f65_sre ' SRE absx
+        CASE &H60: f65_cyc = 6: f65_rts ' RTS imp
+        CASE &H61: f65_cyc = 6: f65_indx: f65_adc ' ADC indx
+        CASE &H62: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H63: f65_cyc = 8: f65_indx: f65_rra ' RRA indx
+        CASE &H64: f65_cyc = 3: f65_zp: f65_nopr ' NOP zp
+        CASE &H65: f65_cyc = 3: f65_zp: f65_adc ' ADC zp
+        CASE &H66: f65_cyc = 5: f65_zp: f65_ror ' ROR zp
+        CASE &H67: f65_cyc = 5: f65_zp: f65_rra ' RRA zp
+        CASE &H68: f65_cyc = 4: f65_pla ' PLA imp
+        CASE &H69: f65_cyc = 2: f65_imm: f65_adc ' ADC imm
+        CASE &H6A: f65_cyc = 2: f65_rora ' ROR acc
+        CASE &H6B: f65_cyc = 2: f65_imm: f65_arr ' ARR imm
+        CASE &H6C: f65_cyc = 5: f65_ind: f65_jmp ' JMP ind
+        CASE &H6D: f65_cyc = 4: f65_abs: f65_adc ' ADC abs
+        CASE &H6E: f65_cyc = 6: f65_abs: f65_ror ' ROR abs
+        CASE &H6F: f65_cyc = 6: f65_abs: f65_rra ' RRA abs
+        CASE &H70: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_OVERFLOW) <> 0 ' BVS rel
+        CASE &H71: f65_cyc = 5: f65_indyr: f65_adc ' ADC indy
+        CASE &H72: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H73: f65_cyc = 8: f65_indy: f65_rra ' RRA indy
+        CASE &H74: f65_cyc = 4: f65_zpx: f65_nopr ' NOP zpx
+        CASE &H75: f65_cyc = 4: f65_zpx: f65_adc ' ADC zpx
+        CASE &H76: f65_cyc = 6: f65_zpx: f65_ror ' ROR zpx
+        CASE &H77: f65_cyc = 6: f65_zpx: f65_rra ' RRA zpx
+        CASE &H78: f65_cyc = 2: cpu6502.status = cpu6502.status OR F6502_FLAG_INTERRUPT ' SEI imp
+        CASE &H79: f65_cyc = 4: f65_absyr: f65_adc ' ADC absy
+        CASE &H7A: f65_cyc = 2 ' NOP imp
+        CASE &H7B: f65_cyc = 7: f65_absy: f65_rra ' RRA absy
+        CASE &H7C: f65_cyc = 4: f65_absxr: f65_nopr ' NOP absx
+        CASE &H7D: f65_cyc = 4: f65_absxr: f65_adc ' ADC absx
+        CASE &H7E: f65_cyc = 7: f65_absx: f65_ror ' ROR absx
+        CASE &H7F: f65_cyc = 7: f65_absx: f65_rra ' RRA absx
+        CASE &H80: f65_cyc = 2: f65_imm: f65_nopr ' NOP imm
+        CASE &H81: f65_cyc = 6: f65_indx: f65_sta ' STA indx
+        CASE &H82: f65_cyc = 2: f65_imm: f65_nopr ' NOP imm
+        CASE &H83: f65_cyc = 6: f65_indx: f65_sax ' SAX indx
+        CASE &H84: f65_cyc = 3: f65_zp: f65_sty ' STY zp
+        CASE &H85: f65_cyc = 3: f65_zp: f65_sta ' STA zp
+        CASE &H86: f65_cyc = 3: f65_zp: f65_stx ' STX zp
+        CASE &H87: f65_cyc = 3: f65_zp: f65_sax ' SAX zp
+        CASE &H88: f65_cyc = 2: f65_dey ' DEY imp
+        CASE &H89: f65_cyc = 2: f65_imm: f65_nopr ' NOP imm
+        CASE &H8A: f65_cyc = 2: f65_txa ' TXA imp
+        CASE &H8B: f65_cyc = 2: f65_imm: f65_ane ' ANE imm
+        CASE &H8C: f65_cyc = 4: f65_abs: f65_sty ' STY abs
+        CASE &H8D: f65_cyc = 4: f65_abs: f65_sta ' STA abs
+        CASE &H8E: f65_cyc = 4: f65_abs: f65_stx ' STX abs
+        CASE &H8F: f65_cyc = 4: f65_abs: f65_sax ' SAX abs
+        CASE &H90: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_CARRY) = 0 ' BCC rel
+        CASE &H91: f65_cyc = 6: f65_indy: f65_sta ' STA indy
+        CASE &H92: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &H93: f65_cyc = 6: f65_indy: f65_sha ' SHA indy
+        CASE &H94: f65_cyc = 4: f65_zpx: f65_sty ' STY zpx
+        CASE &H95: f65_cyc = 4: f65_zpx: f65_sta ' STA zpx
+        CASE &H96: f65_cyc = 4: f65_zpy: f65_stx ' STX zpy
+        CASE &H97: f65_cyc = 4: f65_zpy: f65_sax ' SAX zpy
+        CASE &H98: f65_cyc = 2: f65_tya ' TYA imp
+        CASE &H99: f65_cyc = 5: f65_absy: f65_sta ' STA absy
+        CASE &H9A: f65_cyc = 2: f65_txs ' TXS imp
+        CASE &H9B: f65_cyc = 5: f65_absy: f65_tas ' TAS absy
+        CASE &H9C: f65_cyc = 5: f65_absx: f65_shy ' SHY absx
+        CASE &H9D: f65_cyc = 5: f65_absx: f65_sta ' STA absx
+        CASE &H9E: f65_cyc = 5: f65_absy: f65_shx ' SHX absy
+        CASE &H9F: f65_cyc = 5: f65_absy: f65_sha ' SHA absy
+        CASE &HA0: f65_cyc = 2: f65_imm: f65_ldy ' LDY imm
+        CASE &HA1: f65_cyc = 6: f65_indx: f65_lda ' LDA indx
+        CASE &HA2: f65_cyc = 2: f65_imm: f65_ldx ' LDX imm
+        CASE &HA3: f65_cyc = 6: f65_indx: f65_lax ' LAX indx
+        CASE &HA4: f65_cyc = 3: f65_zp: f65_ldy ' LDY zp
+        CASE &HA5: f65_cyc = 3: f65_zp: f65_lda ' LDA zp
+        CASE &HA6: f65_cyc = 3: f65_zp: f65_ldx ' LDX zp
+        CASE &HA7: f65_cyc = 3: f65_zp: f65_lax ' LAX zp
+        CASE &HA8: f65_cyc = 2: f65_tay ' TAY imp
+        CASE &HA9: f65_cyc = 2: f65_imm: f65_lda ' LDA imm
+        CASE &HAA: f65_cyc = 2: f65_tax ' TAX imp
+        CASE &HAB: f65_cyc = 2: f65_imm: f65_lxa ' LXA imm
+        CASE &HAC: f65_cyc = 4: f65_abs: f65_ldy ' LDY abs
+        CASE &HAD: f65_cyc = 4: f65_abs: f65_lda ' LDA abs
+        CASE &HAE: f65_cyc = 4: f65_abs: f65_ldx ' LDX abs
+        CASE &HAF: f65_cyc = 4: f65_abs: f65_lax ' LAX abs
+        CASE &HB0: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_CARRY) <> 0 ' BCS rel
+        CASE &HB1: f65_cyc = 5: f65_indyr: f65_lda ' LDA indy
+        CASE &HB2: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &HB3: f65_cyc = 5: f65_indyr: f65_lax ' LAX indy
+        CASE &HB4: f65_cyc = 4: f65_zpx: f65_ldy ' LDY zpx
+        CASE &HB5: f65_cyc = 4: f65_zpx: f65_lda ' LDA zpx
+        CASE &HB6: f65_cyc = 4: f65_zpy: f65_ldx ' LDX zpy
+        CASE &HB7: f65_cyc = 4: f65_zpy: f65_lax ' LAX zpy
+        CASE &HB8: f65_cyc = 2: cpu6502.status = cpu6502.status AND (NOT F6502_FLAG_OVERFLOW) ' CLV imp
+        CASE &HB9: f65_cyc = 4: f65_absyr: f65_lda ' LDA absy
+        CASE &HBA: f65_cyc = 2: f65_tsx ' TSX imp
+        CASE &HBB: f65_cyc = 4: f65_absyr: f65_las ' LAS absy
+        CASE &HBC: f65_cyc = 4: f65_absxr: f65_ldy ' LDY absx
+        CASE &HBD: f65_cyc = 4: f65_absxr: f65_lda ' LDA absx
+        CASE &HBE: f65_cyc = 4: f65_absyr: f65_ldx ' LDX absy
+        CASE &HBF: f65_cyc = 4: f65_absyr: f65_lax ' LAX absy
+        CASE &HC0: f65_cyc = 2: f65_imm: f65_cpy ' CPY imm
+        CASE &HC1: f65_cyc = 6: f65_indx: f65_cmp ' CMP indx
+        CASE &HC2: f65_cyc = 2: f65_imm: f65_nopr ' NOP imm
+        CASE &HC3: f65_cyc = 8: f65_indx: f65_dcp ' DCP indx
+        CASE &HC4: f65_cyc = 3: f65_zp: f65_cpy ' CPY zp
+        CASE &HC5: f65_cyc = 3: f65_zp: f65_cmp ' CMP zp
+        CASE &HC6: f65_cyc = 5: f65_zp: f65_dec ' DEC zp
+        CASE &HC7: f65_cyc = 5: f65_zp: f65_dcp ' DCP zp
+        CASE &HC8: f65_cyc = 2: f65_iny ' INY imp
+        CASE &HC9: f65_cyc = 2: f65_imm: f65_cmp ' CMP imm
+        CASE &HCA: f65_cyc = 2: f65_dex ' DEX imp
+        CASE &HCB: f65_cyc = 2: f65_imm: f65_sbx ' SBX imm
+        CASE &HCC: f65_cyc = 4: f65_abs: f65_cpy ' CPY abs
+        CASE &HCD: f65_cyc = 4: f65_abs: f65_cmp ' CMP abs
+        CASE &HCE: f65_cyc = 6: f65_abs: f65_dec ' DEC abs
+        CASE &HCF: f65_cyc = 6: f65_abs: f65_dcp ' DCP abs
+        CASE &HD0: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_ZERO) = 0 ' BNE rel
+        CASE &HD1: f65_cyc = 5: f65_indyr: f65_cmp ' CMP indy
+        CASE &HD2: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &HD3: f65_cyc = 8: f65_indy: f65_dcp ' DCP indy
+        CASE &HD4: f65_cyc = 4: f65_zpx: f65_nopr ' NOP zpx
+        CASE &HD5: f65_cyc = 4: f65_zpx: f65_cmp ' CMP zpx
+        CASE &HD6: f65_cyc = 6: f65_zpx: f65_dec ' DEC zpx
+        CASE &HD7: f65_cyc = 6: f65_zpx: f65_dcp ' DCP zpx
+        CASE &HD8: f65_cyc = 2: cpu6502.status = cpu6502.status AND (NOT F6502_FLAG_DECIMAL) ' CLD imp
+        CASE &HD9: f65_cyc = 4: f65_absyr: f65_cmp ' CMP absy
+        CASE &HDA: f65_cyc = 2 ' NOP imp
+        CASE &HDB: f65_cyc = 7: f65_absy: f65_dcp ' DCP absy
+        CASE &HDC: f65_cyc = 4: f65_absxr: f65_nopr ' NOP absx
+        CASE &HDD: f65_cyc = 4: f65_absxr: f65_cmp ' CMP absx
+        CASE &HDE: f65_cyc = 7: f65_absx: f65_dec ' DEC absx
+        CASE &HDF: f65_cyc = 7: f65_absx: f65_dcp ' DCP absx
+        CASE &HE0: f65_cyc = 2: f65_imm: f65_cpx ' CPX imm
+        CASE &HE1: f65_cyc = 6: f65_indx: f65_sbc ' SBC indx
+        CASE &HE2: f65_cyc = 2: f65_imm: f65_nopr ' NOP imm
+        CASE &HE3: f65_cyc = 8: f65_indx: f65_isc ' ISC indx
+        CASE &HE4: f65_cyc = 3: f65_zp: f65_cpx ' CPX zp
+        CASE &HE5: f65_cyc = 3: f65_zp: f65_sbc ' SBC zp
+        CASE &HE6: f65_cyc = 5: f65_zp: f65_inc ' INC zp
+        CASE &HE7: f65_cyc = 5: f65_zp: f65_isc ' ISC zp
+        CASE &HE8: f65_cyc = 2: f65_inx ' INX imp
+        CASE &HE9: f65_cyc = 2: f65_imm: f65_sbc ' SBC imm
+        CASE &HEA: f65_cyc = 2 ' NOP imp
+        CASE &HEB: f65_cyc = 2: f65_imm: f65_sbc ' SBC imm
+        CASE &HEC: f65_cyc = 4: f65_abs: f65_cpx ' CPX abs
+        CASE &HED: f65_cyc = 4: f65_abs: f65_sbc ' SBC abs
+        CASE &HEE: f65_cyc = 6: f65_abs: f65_inc ' INC abs
+        CASE &HEF: f65_cyc = 6: f65_abs: f65_isc ' ISC abs
+        CASE &HF0: f65_cyc = 2: f65_branch (cpu6502.status AND F6502_FLAG_ZERO) <> 0 ' BEQ rel
+        CASE &HF1: f65_cyc = 5: f65_indyr: f65_sbc ' SBC indy
+        CASE &HF2: f65_cyc = 2: f65_jam ' JAM imp
+        CASE &HF3: f65_cyc = 8: f65_indy: f65_isc ' ISC indy
+        CASE &HF4: f65_cyc = 4: f65_zpx: f65_nopr ' NOP zpx
+        CASE &HF5: f65_cyc = 4: f65_zpx: f65_sbc ' SBC zpx
+        CASE &HF6: f65_cyc = 6: f65_zpx: f65_inc ' INC zpx
+        CASE &HF7: f65_cyc = 6: f65_zpx: f65_isc ' ISC zpx
+        CASE &HF8: f65_cyc = 2: cpu6502.status = cpu6502.status OR F6502_FLAG_DECIMAL ' SED imp
+        CASE &HF9: f65_cyc = 4: f65_absyr: f65_sbc ' SBC absy
+        CASE &HFA: f65_cyc = 2 ' NOP imp
+        CASE &HFB: f65_cyc = 7: f65_absy: f65_isc ' ISC absy
+        CASE &HFC: f65_cyc = 4: f65_absxr: f65_nopr ' NOP absx
+        CASE &HFD: f65_cyc = 4: f65_absxr: f65_sbc ' SBC absx
+        CASE &HFE: f65_cyc = 7: f65_absx: f65_inc ' INC absx
+        CASE &HFF: f65_cyc = 7: f65_absx: f65_isc ' ISC absx
+    END SELECT
+    cpu6502.clockticks = cpu6502.clockticks + f65_cyc
+    cpu6502.instructions = cpu6502.instructions + 1
+END SUB
