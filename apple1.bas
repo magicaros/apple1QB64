@@ -25,12 +25,19 @@
 '   F1  RESET (like the Apple-1 reset switch; memory is kept)
 '   F2  CLEAR SCREEN
 '   F3  or Ctrl+V   paste the clipboard as typed keys
+'   F4  DUMP memory to a hex file (asks for a range, e.g. 6000.7FFF)
+'   F5  LOAD a hex file straight into memory
 '   Backspace types "_" (the Woz Monitor's rub-out), Esc cancels a line
 '
 ' Command line (files are relative to the folder you start from)
-'   apple1 prog.txt          types the file in, e.g. a Woz Monitor hex dump
+'   apple1 prog.hex          loads a hex dump straight into memory (instant)
+'   apple1 prog.txt          types the file in as keystrokes (any commands)
 '   apple1 prog.bin@0300     loads a binary directly into memory at $0300
-'   (any number of each, processed in order)
+'   (any number of each, processed in order, e.g. apple1 basic.hex run.txt)
+'
+' Hex files use the Woz Monitor's own format, 8 bytes per line:
+'   6000: 4C 0A 60 00 00 00 00 00
+' so a dump saved here can also be pasted into a real Apple-1's monitor.
 '=============================================================================
 
 ' Set to 1 to build a console-only version that reads keystrokes from the
@@ -139,13 +146,15 @@ FUNCTION LoadHexDump& (filename AS STRING)
         LINE INPUT #1, ln
         p = INSTR(ln, ":")
         IF p > 0 THEN
-            addr = VAL("&H" + _TRIM$(LEFT$(ln, p - 1)) + "&")
+            tok = UCASE$(_TRIM$(LEFT$(ln, p - 1)))
+            IF IsHex(tok) = 0 THEN _CONTINUE ' not an address line
+            addr = VAL("&H" + tok + "&")
             ln = _TRIM$(MID$(ln, p + 1)) + " "
             DO WHILE LEN(ln) > 1
                 p = INSTR(ln, " ")
                 tok = LEFT$(ln, p - 1)
                 ln = LTRIM$(MID$(ln, p + 1)) + ""
-                IF LEN(tok) THEN
+                IF LEN(tok) > 0 AND LEN(tok) <= 2 AND IsHex(UCASE$(tok)) THEN
                     mem(addr AND &HFFFF&) = VAL("&H" + tok)
                     addr = addr + 1
                     n = n + 1
@@ -157,7 +166,52 @@ FUNCTION LoadHexDump& (filename AS STRING)
     LoadHexDump& = n
 END FUNCTION
 
-' Text files are queued as keystrokes; "file.bin@hhhh" is loaded at $hhhh.
+' Writes start..finish as a Woz Monitor style hex dump (8 bytes per line,
+' lines aligned to 8-byte boundaries just as the monitor prints them).
+' Reads memory directly, so dumping I/O space has no side effects.
+SUB SaveHexDump (start AS LONG, finish AS LONG, filename AS STRING)
+    DIM addr AS LONG, ln AS STRING
+    OPEN filename FOR OUTPUT AS #1
+    FOR addr = start TO finish
+        IF addr = start OR (addr AND 7) = 0 THEN
+            IF LEN(ln) THEN PRINT #1, ln
+            ln = Hex4$(addr) + ":"
+        END IF
+        ln = ln + " " + RIGHT$("0" + HEX$(mem(addr)), 2)
+    NEXT
+    IF LEN(ln) THEN PRINT #1, ln
+    CLOSE #1
+END SUB
+
+FUNCTION Hex4$ (v AS LONG)
+    Hex4$ = RIGHT$("000" + HEX$(v), 4)
+END FUNCTION
+
+' Parses "6000.7FFF" (or a single address "6000") into start and finish.
+' Returns 0 if the text is not a valid range.
+FUNCTION ParseRange& (t AS STRING, start AS LONG, finish AS LONG)
+    DIM p AS LONG, a AS STRING, b AS STRING
+    t = UCASE$(_TRIM$(t))
+    p = INSTR(t, ".")
+    IF p THEN a = LEFT$(t, p - 1): b = MID$(t, p + 1) ELSE a = t: b = t
+    IF IsHex(a) = 0 OR IsHex(b) = 0 THEN EXIT FUNCTION
+    start = VAL("&H" + a + "&")
+    finish = VAL("&H" + b + "&")
+    IF start > finish THEN EXIT FUNCTION
+    ParseRange& = -1
+END FUNCTION
+
+FUNCTION IsHex& (t AS STRING)
+    DIM i AS LONG
+    IF LEN(t) < 1 OR LEN(t) > 4 THEN EXIT FUNCTION
+    FOR i = 1 TO LEN(t)
+        IF INSTR("0123456789ABCDEF", MID$(t, i, 1)) = 0 THEN EXIT FUNCTION
+    NEXT
+    IsHex& = -1
+END FUNCTION
+
+' "file.hex" is loaded straight into memory, "file.bin@hhhh" is loaded at
+' $hhhh, anything else is queued as keystrokes.
 SUB ProcessCommandLine
     DIM i AS LONG, arg AS STRING, p AS LONG, addr AS LONG, buf AS STRING, j AS LONG
     FOR i = 1 TO _COMMANDCOUNT
@@ -175,6 +229,9 @@ SUB ProcessCommandLine
                     mem((addr + j - 1) AND &HFFFF&) = ASC(buf, j)
                 NEXT
             END IF
+        ELSEIF LCASE$(RIGHT$(arg, 4)) = ".hex" THEN
+            arg = FullPath(arg)
+            IF _FILEEXISTS(arg) THEN j = LoadHexDump(arg)
         ELSE
             arg = FullPath(arg)
             IF _FILEEXISTS(arg) THEN
@@ -388,7 +445,7 @@ $ELSE
         _DEST textimg
         _FONT 8
         _DEST 0
-        _TITLE "Apple-1 (Fake6502)  F1 Reset  F2 Clear  F3 Paste"
+        _TITLE "Apple-1 (Fake6502)  F1 Reset  F2 Clear  F3 Paste  F4 Dump  F5 Load"
     END SUB
 
     SUB PlatformFrame
@@ -403,6 +460,8 @@ $ELSE
                     CASE 59: ResetMachine ' F1
                     CASE 60: ClearScreen ' F2
                     CASE 61: TypeText _CLIPBOARD$ ' F3
+                    CASE 62: DumpDialog ' F4
+                    CASE 63: LoadDialog ' F5
                 END SELECT
             ELSE
                 c = ASC(k)
@@ -429,6 +488,31 @@ $ELSE
         _DISPLAY
         _LIMIT FPS
         IF _EXIT THEN quit = -1
+    END SUB
+
+    SUB DumpDialog
+        STATIC lastrange AS STRING
+        DIM r AS STRING, f AS STRING, a AS LONG, b AS LONG
+        IF lastrange = "" THEN lastrange = "0300.03FF"
+        r = _INPUTBOX$("Dump memory", "Address range to save (start.end in hex):", lastrange)
+        IF r = "" THEN EXIT SUB
+        IF ParseRange(r, a, b) = 0 THEN
+            _MESSAGEBOX "Dump memory", "Not a valid range: " + r + CHR$(10) + "Use start.end in hex, e.g. 6000.7FFF", "error"
+            EXIT SUB
+        END IF
+        lastrange = r
+        f = _SAVEFILEDIALOG$("Save hex dump", _STARTDIR$ + "/dump_" + Hex4$(a) + ".hex", "*.hex|*.txt", "Hex dump")
+        IF f = "" THEN EXIT SUB
+        SaveHexDump a, b, f
+        _MESSAGEBOX "Dump memory", "Saved $" + Hex4$(a) + "-$" + Hex4$(b) + " (" + _TRIM$(STR$(b - a + 1)) + " bytes)" + CHR$(10) + f, "info"
+    END SUB
+
+    SUB LoadDialog
+        DIM f AS STRING, n AS LONG
+        f = _OPENFILEDIALOG$("Load hex dump", _STARTDIR$ + "/", "*.hex|*.txt", "Hex dump")
+        IF f = "" THEN EXIT SUB
+        n = LoadHexDump(f)
+        _MESSAGEBOX "Load hex dump", "Loaded" + STR$(n) + " bytes from" + CHR$(10) + f, "info"
     END SUB
 
 $END IF
